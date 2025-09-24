@@ -1,0 +1,2 @@
+pillow>=9.0.0
+windnd>=1.0.8; platform_system=="Windows"
