@@ -1,3 +1,0 @@
-([('PNG元數據解析器',
-   '/Users/apple/Workspace/PNG_info/dist/PNG元數據解析器',
-   'EXECUTABLE')],)
