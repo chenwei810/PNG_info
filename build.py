@@ -119,9 +119,10 @@ def check_environment() -> bool:
     if not ENTRY_SCRIPT.exists():
         print(f'  ✗ 找不到主程式：{ENTRY_SCRIPT.name}')
         return False
-    if not (ROOT / 'pnginfo_core.py').exists():
-        print('  ✗ 找不到 pnginfo_core.py')
-        return False
+    for module in ('pnginfo_core.py', 'pnginfo_editor.py', 'edit_dialogs.py'):
+        if not (ROOT / module).exists():
+            print(f'  ✗ 找不到 {module}')
+            return False
 
     missing = [name for name in REQUIRED_MODULES if importlib.util.find_spec(name) is None]
     for name in REQUIRED_MODULES:

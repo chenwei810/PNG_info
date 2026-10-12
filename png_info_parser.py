@@ -28,6 +28,8 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 import pnginfo_core as core
+import pnginfo_editor as editor
+from edit_dialogs import BatchReplaceDialog, EditDialog
 
 try:
     # 匯入時 tkinterdnd2 就會替所有元件加上 drop_target_register / dnd_bind
@@ -36,7 +38,7 @@ except Exception:  # 沒裝 tkinterdnd2 時仍可用「加入圖片」按鈕
     DND_FILES = TkinterDnD = None
 
 APP_NAME = 'PNG Info 檢視器'
-APP_VERSION = '3.1'
+APP_VERSION = '3.2'
 
 IS_MAC = sys.platform == 'darwin'
 MOD = 'Command' if IS_MAC else 'Control'
@@ -106,9 +108,12 @@ WELCOME_TEXT = f"""把 PNG / JPG / WebP 圖片拖進這個視窗的任何位置�
   {accel('O')}　加入圖片　　　　{accel('O', True)}　加入資料夾
   {accel('1')}　複製正面提示詞　{accel('2')}　複製負面提示詞
   {accel('3')}　複製 LoRA　　　 {accel('4')}　複製生成參數
-  {accel('C', True)}　複製 WebUI 格式　{accel('E')}　匯出目前圖片為 TXT
+  {accel('C', True)}　複製 WebUI 格式　{accel('E', True)}　匯出目前圖片為 TXT
+  {accel('E')}　編輯提示詞與參數（PNG，另存新檔）　{accel('F')}　批次取代
 
-小提示：在 LoRA 或參數清單上連點兩下，可以只複製那一列。"""
+小提示：
+  • 在左側清單的圖片上連點兩下，也可以開啟編輯。
+  • 在 LoRA 或參數清單上連點兩下，可以只複製那一列。"""
 
 NO_META_TEXT = ('這張圖片沒有任何文字中繼資料。\n\n'
                 '常見原因：截圖、經過壓縮或轉檔、從社群網站或聊天軟體下載，'
@@ -147,6 +152,8 @@ class PngInfoApp:
 
         self.auto_follow = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar()
+        self.version = APP_VERSION
+        self._dialog = None   # 目前開著的編輯／批次取代視窗
 
         self._build_menu()
         self._build_ui()
@@ -214,7 +221,8 @@ class PngInfoApp:
         file_menu.add_command(label='加入圖片…', accelerator=accel('O'), command=self.browse_files)
         file_menu.add_command(label='加入資料夾…', accelerator=accel('O', True), command=self.browse_folder)
         file_menu.add_separator()
-        file_menu.add_command(label='匯出目前圖片為 TXT…', accelerator=accel('E'), command=self.export_current_txt)
+        file_menu.add_command(label='匯出目前圖片為 TXT…', accelerator=accel('E', True),
+                              command=self.export_current_txt)
         file_menu.add_command(label='匯出全部為 JSON…', command=lambda: self.export_all('json'))
         file_menu.add_command(label='匯出全部為 CSV…', command=lambda: self.export_all('csv'))
         file_menu.add_separator()
@@ -224,6 +232,13 @@ class PngInfoApp:
         file_menu.add_command(label='移除選取的圖片', command=self.remove_selected)
         file_menu.add_command(label='清空清單', command=self.clear_all)
         menubar.add_cascade(label='檔案', menu=file_menu)
+
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(label='編輯提示詞與參數…', accelerator=accel('E'), command=self.edit_current)
+        edit_menu.add_command(label='批次取代提示詞…', accelerator=accel('F'), command=self.batch_replace)
+        edit_menu.add_separator()
+        edit_menu.add_command(label='另存為無中繼資料的圖片…', command=self.strip_current)
+        menubar.add_cascade(label='編輯', menu=edit_menu)
 
         copy_menu = tk.Menu(menubar, tearoff=0)
         copy_menu.add_command(label='正面提示詞', accelerator=accel('1'), command=lambda: self.copy_field('positive'))
@@ -334,6 +349,8 @@ class PngInfoApp:
         ttk.Button(actions, text='在 Finder 中顯示', command=self.reveal_in_finder).pack(side='left')
         ttk.Button(actions, text='原始中繼資料', command=self.show_raw).pack(side='left', padx=4)
         ttk.Button(actions, text='匯出 TXT…', command=self.export_current_txt).pack(side='left')
+        ttk.Button(actions, text='移除中繼資料…', command=self.strip_current).pack(side='right')
+        ttk.Button(actions, text='編輯…', default='active', command=self.edit_current).pack(side='right', padx=4)
 
         # ── 中間：可調整高度的各個區塊 ──
         body = ttk.PanedWindow(parent, orient='vertical')
@@ -409,14 +426,20 @@ class PngInfoApp:
         return tree
 
     def _bind_shortcuts(self) -> None:
-        bind = self.root.bind_all
-        bind(f'<{MOD}-o>', lambda e: self.browse_files())
-        bind(f'<{MOD}-O>', lambda e: self.browse_folder())          # 加上 Shift
-        bind(f'<{MOD}-e>', lambda e: self.export_current_txt())
-        bind(f'<{MOD}-C>', lambda e: self.copy_field('webui'))      # 加上 Shift
+        def bind(sequence: str, action) -> None:
+            # 編輯／批次取代視窗開著的時候，主視窗的快捷鍵都不動作
+            self.root.bind_all(sequence, lambda e: None if self._dialog_open() else action())
+
+        bind(f'<{MOD}-o>', self.browse_files)
+        bind(f'<{MOD}-O>', self.browse_folder)                      # 加上 Shift
+        bind(f'<{MOD}-e>', self.edit_current)
+        bind(f'<{MOD}-E>', self.export_current_txt)                 # 加上 Shift
+        bind(f'<{MOD}-f>', self.batch_replace)
+        bind(f'<{MOD}-C>', lambda: self.copy_field('webui'))        # 加上 Shift
         # 數字鍵一定要寫成 Key-1，否則 Tk 會當成滑鼠按鍵 1
         for key, field in (('1', 'positive'), ('2', 'negative'), ('3', 'loras'), ('4', 'params')):
-            bind(f'<{MOD}-Key-{key}>', lambda e, f=field: self.copy_field(f))
+            bind(f'<{MOD}-Key-{key}>', lambda f=field: self.copy_field(f))
+        self.tree.bind('<Double-1>', lambda e: self.edit_current() if self.tree.identify_row(e.y) else None)
 
     # ──────────────────────────────────────────────
     # 拖放與 macOS 事件
@@ -527,7 +550,8 @@ class PngInfoApp:
     # 清單操作
     # ──────────────────────────────────────────────
 
-    def add_paths(self, paths) -> None:
+    def add_paths(self, paths, select: bool = False) -> None:
+        """select=True：不管「自動跳到最新」有沒有勾，都選取這批的第一張（剛存好的檔案用）"""
         files = core.expand_paths(paths)
         if not files:
             self.set_status('沒有找到支援的圖片（PNG / JPG / WebP）')
@@ -564,7 +588,7 @@ class PngInfoApp:
         else:
             self.set_status('這些圖片已經在清單中')
 
-        if first_iid and (self.auto_follow.get() or self.current_iid is None):
+        if first_iid and (select or self.auto_follow.get() or self.current_iid is None):
             if self.entries[first_iid]['info'] is not None:
                 self._select(first_iid)
             else:
@@ -876,6 +900,81 @@ class PngInfoApp:
             self.set_status(f'✓ 已匯出 {len(infos)} 張：{os.path.basename(path)}')
         except OSError as exc:
             messagebox.showerror('匯出失敗', str(exc), parent=self.root)
+
+    # ──────────────────────────────────────────────
+    # 編輯（只支援 PNG，一律另存新檔）
+    # ──────────────────────────────────────────────
+
+    def _dialog_open(self) -> bool:
+        try:
+            return self._dialog is not None and bool(self._dialog.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def edit_current(self) -> EditDialog | None:
+        if self._dialog_open():
+            return None
+        info = self._current_info()
+        if info is None:
+            self.set_status('請先選擇一張已解析完成的圖片')
+            return None
+        try:
+            session = editor.build_session(info)
+        except editor.EditError as exc:
+            messagebox.showinfo('無法編輯這張圖片', str(exc), parent=self.root)
+            return None
+        self._dialog = EditDialog(self, session, self._after_save)
+        return self._dialog
+
+    def _after_save(self, result: editor.SaveResult) -> None:
+        self._dialog = None
+        self.add_paths([result.path], select=True)
+        self.set_status(f'✓ 已另存為 {os.path.basename(result.path)}（修改了 {len(result.changed_labels)} 個欄位）')
+        if result.warnings:
+            messagebox.showwarning('已另存，但有欄位需要注意', '\n\n'.join(result.warnings), parent=self.root)
+
+    def batch_replace(self) -> BatchReplaceDialog | None:
+        if self._dialog_open():
+            return None
+        all_items = list(self.tree.get_children())
+        if not all_items:
+            self.set_status('清單是空的，請先加入圖片')
+            return None
+        selected = [iid for iid in all_items if iid in self.tree.selection()]
+        self._dialog = BatchReplaceDialog(self, selected, all_items)
+        return self._dialog
+
+    def strip_current(self, dst: str | None = None) -> str | None:
+        if self._dialog_open():
+            return None
+        info = self._current_info()
+        if info is None:
+            self.set_status('請先選擇一張已解析完成的圖片')
+            return None
+        if not editor.is_png(info.path):
+            messagebox.showinfo('無法處理', '目前只支援 PNG 圖片。', parent=self.root)
+            return None
+        if not info.raw:
+            self.set_status('這張圖片本來就沒有文字中繼資料')
+            return None
+        if dst is None:
+            suggestion = editor.unique_path(info.path, '_clean')
+            dst = filedialog.asksaveasfilename(
+                parent=self.root, title='另存為無中繼資料的圖片', initialdir=os.path.dirname(suggestion),
+                initialfile=os.path.basename(suggestion), defaultextension='.png',
+                filetypes=[('PNG 圖片', '*.png')])
+            if not dst:
+                return None
+            if not dst.lower().endswith('.png'):
+                dst += '.png'
+        try:
+            removed = editor.strip_metadata(info.path, dst)
+        except (editor.EditError, OSError) as exc:
+            messagebox.showerror('無法存檔', str(exc), parent=self.root)
+            return None
+        self.add_paths([dst], select=True)
+        self.set_status(f'✓ 已另存為 {os.path.basename(dst)}（移除 {removed} 個中繼資料區塊，畫面完全相同）')
+        return dst
 
     def show_about(self) -> None:
         dnd = (f'已啟用（tkinterdnd2 {_dnd_package_version()}）' if self.dnd_enabled
